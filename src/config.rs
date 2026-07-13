@@ -20,17 +20,42 @@ pub struct Route {
 #[serde(tag = "type")]
 pub enum Destination {
     #[serde(rename = "transfer")]
-    Transfer { host: String, port: u16 },
+    Transfer {
+        host: String, port: u16,
+        #[serde(default)]
+        transfer_mode: TransferMode,
+        #[serde(default)]
+        rewrite_address: bool
+    },
     #[serde(rename = "kick")]
     Kick { message: serde_json::Value },
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(tag = "type")]
+pub enum TransferMode {
+    #[default]
+    #[serde(rename = "transfer")]
+    Transfer,
+    #[serde(rename = "opportunistic")]
+    Opportunistic {
+        haproxy: bool,
+    },
+    #[serde(rename = "proxy")]
+    Proxy {
+        haproxy: bool,
+    }
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
 pub enum StatusConfig {
+    #[serde(rename = "static")]
     Static {
         json: serde_json::Value,
         fake_protocol_version: bool,
     },
+    #[serde(rename = "fetch_from")]
     FetchFrom {
         host: String,
         port: u16,
@@ -74,12 +99,10 @@ impl Route {
         }
 
         if let Some(suffix) = self.pattern.strip_prefix("*.") {
-            // *.example.com matches foo.example.com, bar.example.com, etc.
             return address == suffix || address.ends_with(&format!(".{suffix}"));
         }
 
         if let Some(prefix) = self.pattern.strip_suffix(".*") {
-            // example.* matches example.com, example.org, etc.
             return address.starts_with(prefix)
                 && (address.len() == prefix.len()
                     || address.as_bytes().get(prefix.len()) == Some(&b'.'));

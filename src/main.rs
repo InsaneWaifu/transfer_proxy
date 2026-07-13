@@ -7,6 +7,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     io::{Cursor, ErrorKind},
+    net::{IpAddr, SocketAddr},
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
@@ -18,6 +19,7 @@ use mc_protocol::{
 };
 use snafu::{ErrorCompat, OptionExt, ResultExt, Snafu, Whatever, ensure};
 use tokio::{
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     time::{error::Elapsed, timeout},
 };
@@ -25,7 +27,7 @@ use tracing::{Instrument, error, info, trace, warn};
 use tracing_subscriber::fmt::time::UtcTime;
 
 use crate::{
-    config::{Config, Destination, StatusConfig},
+    config::{Config, Destination, Route, StatusConfig, TransferMode},
     packets::{
         C2SPluginMessage, ClientInformation, Handshake, LoginDisconnect, LoginStart, LoginSuccess,
         PingPong, S2CStatusResponse, Transfer,
@@ -80,6 +82,10 @@ enum ProxyError {
     FetchingStatus {
         source: std::io::Error,
     },
+
+    Proxy {
+        source: std::io::Error,
+    },
 }
 
 type Result<T, E = ProxyError> = std::result::Result<T, E>;
@@ -118,23 +124,28 @@ enum ConnectionState {
     Handshake,
     Login,
     Configuration,
+    Status,
+    Proxy,
 }
 
 struct Connection {
-    stream: TcpStream,
+    /// NB: May be None when taken from the Connection while proxying. If state == Proxy, don't attempt to read/write to the connection
+    stream: Option<TcpStream>,
+    address: SocketAddr,
     state: ConnectionState,
 }
 
 impl Connection {
-    fn new(stream: TcpStream) -> Self {
+    fn new(stream: TcpStream, address: SocketAddr) -> Self {
         Self {
-            stream,
+            stream: Some(stream),
+            address,
             state: ConnectionState::Handshake,
         }
     }
 
     async fn read_packet(&mut self) -> Result<UncompressedPacket> {
-        RawPacket::read_async(&mut self.stream)
+        RawPacket::read_async(self.stream.as_mut().unwrap())
             .await
             .context(ProtocolSnafu)?
             .as_uncompressed()
@@ -143,7 +154,7 @@ impl Connection {
 
     async fn write_packet(&mut self, packet: UncompressedPacket) -> Result<()> {
         packet
-            .write_async(&mut self.stream)
+            .write_async(self.stream.as_mut().unwrap())
             .await
             .context(ProtocolSnafu)
     }
@@ -196,144 +207,114 @@ struct Context {
     cache: StatusCache,
 }
 
-async fn handle(conn: &mut Connection, ctx: &Context) -> Result<()> {
-    let handshake: Handshake = conn.read_packet_as().await?;
-    trace!("{handshake:?}");
-    tracing::Span::current().record("a", &handshake.server_address);
+async fn handle_status(
+    conn: &mut Connection,
+    ctx: &'static Context,
+    matched: &Route,
+    handshake: &Handshake,
+) -> Result<()> {
+    let status_request = conn.read_packet().await?;
 
-    // In the login state, we send disconnect messages as json components, which is easier than NBT
-    // So we will match the target hostname here
-    let Some(matched) = ctx.config.match_host(&handshake.server_address) else {
-        info!("...did not match");
-        if handshake.intent == Handshake::INTENT_LOGIN {
-            const TEXT_COULD_NOT_FIND_A_DESTINATION: &str =
-                r#"{"text": "Could not find a destination to transfer you to", "color": "red"}"#;
-            conn.write_packet(make_raw(&LoginDisconnect {
-                reason: TEXT_COULD_NOT_FIND_A_DESTINATION.to_owned(),
-            })?)
-            .await?;
+    // magic number: status request
+    ensure!(
+        status_request.packet_id == 0,
+        UnexpectedPacketSnafu {
+            found: status_request.packet_id,
+            expected: 0,
+            expected_name: "(fake) status request"
         }
-        return Ok(());
-    };
+    );
 
-    match handshake.intent {
-        Handshake::INTENT_LOGIN => (),
-        Handshake::INTENT_STATUS => {
-            let status_request = conn.read_packet().await?;
-
-            // magic number: status request
-            ensure!(
-                status_request.packet_id == 0,
-                UnexpectedPacketSnafu {
-                    found: status_request.packet_id,
-                    expected: 0,
-                    expected_name: "(fake) status request"
-                }
-            );
-
-            match &matched.status {
-                StatusConfig::Static {
-                    json,
-                    fake_protocol_version,
-                } => {
-                    let mut json = json.clone();
-                    if *fake_protocol_version {
-                        json.as_object_mut()
-                            .expect("Expected an object for status json")
-                            .get_mut("version")
-                            .expect("Expected a 'version' field")
-                            .as_object_mut()
-                            .expect("Version should be an object")
-                            .insert(
-                                "protocol".to_owned(),
-                                serde_json::Value::Number(serde_json::Number::from_i128(
-                                    handshake.protocol_version.0 as _,
-                                ).unwrap()),
-                            );
+    match &matched.status {
+        StatusConfig::Static {
+            json,
+            fake_protocol_version,
+        } => {
+            let mut json = json.clone();
+            if *fake_protocol_version {
+                json.as_object_mut()
+                    .expect("Expected an object for status json")
+                    .get_mut("version")
+                    .expect("Expected a 'version' field")
+                    .as_object_mut()
+                    .expect("Version should be an object")
+                    .insert(
+                        "protocol".to_owned(),
+                        serde_json::Value::Number(
+                            serde_json::Number::from_i128(handshake.protocol_version.0 as _)
+                                .unwrap(),
+                        ),
+                    );
+            }
+            let as_json = serde_json::to_string(&json).expect("valid json");
+            trace!("{}", as_json);
+            conn.write_packet(make_raw(&S2CStatusResponse { response: as_json })?)
+                .await?;
+        }
+        StatusConfig::FetchFrom {
+            host,
+            port,
+            rewrite_address,
+            ..
+        } => {
+            let cache_key = matched.status.cache_key().unwrap();
+            let ttl = matched.status.cache_ttl().unwrap();
+            let response = match ctx.cache.get(&cache_key, ttl) {
+                Some(cached) => cached,
+                None => {
+                    let mut fetch_from_stream = timeout(
+                        Duration::from_secs(3),
+                        TcpStream::connect((host.as_str(), *port)),
+                    )
+                    .await
+                    .context(TimeoutSnafu)?
+                    .context(FetchingStatusSnafu)?;
+                    let mut handshake2 = handshake.clone();
+                    if *rewrite_address {
+                        handshake2.server_address = host.clone();
+                        handshake2.server_port = *port;
                     }
-                    let as_json = serde_json::to_string(&json).expect("valid json");
-                    trace!("{}", as_json);
-                    conn.write_packet(make_raw(&S2CStatusResponse { response: as_json })?)
-                        .await?;
-                }
-                StatusConfig::FetchFrom {
-                    host,
-                    port,
-                    rewrite_address,
-                    ..
-                } => {
-                    let cache_key = matched.status.cache_key().unwrap();
-                    let ttl = matched.status.cache_ttl().unwrap();
-                    let response = match ctx.cache.get(&cache_key, ttl) {
-                        Some(cached) => cached,
-                        None => {
-                            let mut fetch_from_stream = timeout(
-                                Duration::from_secs(3),
-                                TcpStream::connect((host.as_str(), *port)),
-                            )
+                    make_raw(&handshake2)?
+                        .write_async(&mut fetch_from_stream)
+                        .await
+                        .unwrap();
+                    status_request
+                        .write_async(&mut fetch_from_stream)
+                        .await
+                        .context(ProtocolSnafu)?;
+                    let response = RawPacket::read_async(&mut fetch_from_stream)
+                        .await
+                        .context(ProtocolSnafu)?
+                        .as_uncompressed()
+                        .context(ProtocolSnafu)?;
+                    let _: S2CStatusResponse = decode_packet_as(response.clone())?;
+                    ctx.cache.set(cache_key, response.clone());
+                    tokio::task::spawn(async move {
+                        make_raw(&PingPong { timestamp: 0 })
+                            .unwrap()
+                            .write_async(&mut fetch_from_stream)
                             .await
-                            .context(TimeoutSnafu)?
-                            .context(FetchingStatusSnafu)?;
-                            let mut handshake2 = handshake.clone();
-                            if *rewrite_address {
-                                handshake2.server_address = host.clone();
-                                handshake2.server_port = *port;
-                            }
-                            make_raw(&handshake2)?
-                                .write_async(&mut fetch_from_stream)
-                                .await
-                                .unwrap();
-                            status_request
-                                .write_async(&mut fetch_from_stream)
-                                .await
-                                .context(ProtocolSnafu)?;
-                            let response = RawPacket::read_async(&mut fetch_from_stream)
-                                .await
-                                .context(ProtocolSnafu)?
-                                .as_uncompressed()
-                                .context(ProtocolSnafu)?;
-                            let _: S2CStatusResponse = decode_packet_as(response.clone())?;
-                            ctx.cache.set(cache_key, response.clone());
-                            tokio::task::spawn(async move {
-                                make_raw(&PingPong { timestamp: 0 })
-                                    .unwrap()
-                                    .write_async(&mut fetch_from_stream)
-                                    .await
-                                    .unwrap();
-                                let _ = RawPacket::read_async(&mut fetch_from_stream).await;
-                                drop(fetch_from_stream);
-                            });
-                            response
-                        }
-                    };
-                    conn.write_packet(response).await?;
+                            .unwrap();
+                        let _ = RawPacket::read_async(&mut fetch_from_stream).await;
+                        drop(fetch_from_stream);
+                    });
+                    response
                 }
-            }
-
-            let pong_request: PingPong = conn.read_packet_as().await?;
-            conn.write_packet(make_raw(&pong_request)?).await?;
-            return Ok(());
-        }
-        Handshake::INTENT_TRANSFER => {
-            const TEXT_NOT_ACCEPTING_TRANSFERS: &str =
-                r#"{"translate": "multiplayer.disconnect.transfers_disabled", "color": "red"}"#;
-            conn.write_packet(make_raw(&LoginDisconnect {
-                reason: TEXT_NOT_ACCEPTING_TRANSFERS.to_owned(),
-            })?)
-            .await?;
-            return Ok(());
-        }
-        i => {
-            return Err(BadPacketSnafu {
-                message: format!("Unknown intent {i}"),
-            }
-            .build());
+            };
+            conn.write_packet(response).await?;
         }
     }
+    let pong_request: PingPong = conn.read_packet_as().await?;
+    conn.write_packet(make_raw(&pong_request)?).await?;
+    Ok(())
+}
 
-    // We are in login state immediately after receiving a handshake packet
-    conn.state = ConnectionState::Login;
-
+async fn handle_transfer(
+    conn: &mut Connection,
+    _ctx: &'static Context,
+    matched: &Route,
+    handshake: &Handshake,
+) -> Result<()> {
     let login_start: LoginStart = conn.read_packet_as().await?;
     trace!("{login_start:?}");
     tracing::Span::current().record("u", &login_start.username);
@@ -392,7 +373,12 @@ async fn handle(conn: &mut Connection, ctx: &Context) -> Result<()> {
 
     conn.state = ConnectionState::Configuration;
 
-    let Destination::Transfer { host, port } = &matched.destination else {
+    let Destination::Transfer {
+        host,
+        port,
+        ..
+    } = &matched.destination
+    else {
         unreachable!()
     };
 
@@ -418,6 +404,191 @@ async fn handle(conn: &mut Connection, ctx: &Context) -> Result<()> {
             C2SPluginMessage::PACKET_ID => {}
             x => warn!("unknown packet type of id 0x{x:x}"),
         }
+    }
+}
+
+async fn handle_proxy(
+    conn: &mut Connection,
+    _ctx: &'static Context,
+    matched: &Route,
+    handshake: &Handshake,
+) -> Result<()> {
+    // Essentially, we are just going to MITM the connection between the client and the server
+    // At this point, the only packet we have received so far is the handshake. We just forward it to the target server
+    let Destination::Transfer {
+        host,
+        port,
+        transfer_mode,
+        rewrite_address
+    } = &matched.destination
+    else {
+        unreachable!()
+    };
+
+    info!("Proxying to {host}:{port}");
+
+    let haproxy = match transfer_mode {
+        TransferMode::Opportunistic { haproxy } | TransferMode::Proxy { haproxy } => *haproxy,
+        _ => false,
+    };
+    let mut handshake = handshake.clone();
+
+    if *rewrite_address {
+        handshake.server_address = host.clone();
+        handshake.server_port = *port;
+    }
+
+    let mut stream = timeout(
+        Duration::from_secs(3),
+        TcpStream::connect((host.as_str(), *port)),
+    )
+    .await
+    .context(TimeoutSnafu)?
+    .context(FetchingStatusSnafu)?;
+
+    if haproxy {
+        const HAPROXY_HEADER_V2: &[u8] = &[
+            // magic header
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+            //  version 2, PROXY
+            0x21,
+        ];
+        stream
+            .write_all(HAPROXY_HEADER_V2)
+            .await
+            .context(ProxySnafu)?;
+        let local_addr = conn.stream.as_ref().unwrap().local_addr().unwrap();
+        if let IpAddr::V4(ip) = conn.address.ip() {
+            // tcp + v4
+            stream.write_u8(0x11).await.context(ProxySnafu)?;
+            // ipv4 tcp length
+            stream.write_u16(12).await.context(ProxySnafu)?;
+            // ipv4 source addr
+            stream.write(&ip.octets()).await.context(ProxySnafu)?;
+            // ipv4 dest addr
+            let IpAddr::V4(dest_ip) = local_addr.ip() else {
+                unreachable!()
+            };
+            stream.write(&dest_ip.octets()).await.context(ProxySnafu)?;
+        } else if conn.address.ip().is_ipv6() {
+            // tcp + v6
+            stream.write_u8(0x21).await.context(ProxySnafu)?;
+            // ipv6 tcp length
+            stream.write_u16(36).await.context(ProxySnafu)?;
+            // ipv6 source addr
+            let IpAddr::V6(ip) = conn.address.ip() else {
+                unreachable!()
+            };
+            stream.write(&ip.octets()).await.context(ProxySnafu)?;
+            // ipv6 dest addr
+            let IpAddr::V6(dest_ip) = local_addr.ip() else {
+                unreachable!()
+            };
+            stream.write(&dest_ip.octets()).await.context(ProxySnafu)?;
+        } else {
+            unreachable!()
+        }
+        // source port
+        stream
+            .write_u16(conn.address.port())
+            .await
+            .context(ProxySnafu)?;
+        // dest port
+        stream
+            .write_u16(local_addr.port())
+            .await
+            .context(ProxySnafu)?;
+    }
+
+    let raw = make_raw(&handshake)?;
+    raw.write_async(&mut stream).await.context(ProtocolSnafu)?;
+
+    conn.state = ConnectionState::Proxy;
+    // At this point, the remote server matches the client's expected state.
+    let mut client_connection = conn.stream.take().unwrap();
+
+    // NB: This is very much a "poor man's proxy". By directly channeling the packets, we can avoid the need to MITM encryption and compression
+    // Since we don't account for either encryption or compression, we cannot inspect packets sent. However, this means no additional configuration is required
+    // on the destination server
+    tokio::io::copy_bidirectional(&mut client_connection, &mut stream)
+        .await
+        .context(ProxySnafu)?;
+
+    Ok(())
+}
+
+async fn handle(conn: &mut Connection, ctx: &'static Context) -> Result<()> {
+    let handshake: Handshake = conn.read_packet_as().await?;
+    trace!("{handshake:?}");
+    tracing::Span::current().record("a", &handshake.server_address);
+
+    match handshake.intent {
+        Handshake::INTENT_LOGIN => conn.state = ConnectionState::Login,
+        Handshake::INTENT_STATUS => conn.state = ConnectionState::Status,
+        Handshake::INTENT_TRANSFER => {
+            conn.state = ConnectionState::Login;
+            const TEXT_NOT_ACCEPTING_TRANSFERS: &str =
+                r#"{"translate": "multiplayer.disconnect.transfers_disabled", "color": "red"}"#;
+            conn.write_packet(make_raw(&LoginDisconnect {
+                reason: TEXT_NOT_ACCEPTING_TRANSFERS.to_owned(),
+            })?)
+            .await?;
+            return Ok(());
+        }
+        _ => {
+            return Err(BadPacketSnafu {
+                message: format!("Unknown intent {handshake:?}"),
+            }
+            .build());
+        }
+    };
+
+    let Some(matched) = ctx.config.match_host(&handshake.server_address) else {
+        info!("...did not match");
+        if handshake.intent == Handshake::INTENT_LOGIN {
+            const TEXT_COULD_NOT_FIND_A_DESTINATION: &str =
+                r#"{"text": "Could not find a destination to transfer you to", "color": "red"}"#;
+            conn.write_packet(make_raw(&LoginDisconnect {
+                reason: TEXT_COULD_NOT_FIND_A_DESTINATION.to_owned(),
+            })?)
+            .await?;
+        }
+        return Ok(());
+    };
+
+    const TEXT_PROTOCOL_VERSION_TOO_LOW: &str = r#"{"text": "Your client does not support the transfer packet - please upgrade, or ask your administrator to enable proxying", "color": "red"}"#;
+
+    match (handshake.intent, &matched.destination) {
+        (Handshake::INTENT_STATUS, _) => handle_status(conn, ctx, matched, &handshake).await,
+        (Handshake::INTENT_LOGIN, Destination::Kick { message }) => {
+            conn.write_packet(make_raw(&LoginDisconnect {
+                reason: serde_json::to_string(&message).expect("valid json"),
+            })?)
+            .await?;
+            Ok(())
+        }
+        (Handshake::INTENT_LOGIN, Destination::Transfer { transfer_mode, .. }) => {
+            match (transfer_mode, handshake.protocol_version.0) {
+                // Transfer packet was added in protocol version 766; reject prior versions if proxying is not supported
+                (TransferMode::Transfer, ..766) => {
+                    conn.write_packet(make_raw(&LoginDisconnect {
+                        reason: TEXT_PROTOCOL_VERSION_TOO_LOW.to_owned(),
+                    })?)
+                    .await?;
+                    Ok(())
+                }
+                (TransferMode::Transfer | TransferMode::Opportunistic { .. }, 766..) => {
+                    handle_transfer(conn, ctx, matched, &handshake).await
+                }
+                (TransferMode::Opportunistic { .. }, ..766) => {
+                    handle_proxy(conn, ctx, matched, &handshake).await
+                }
+                (TransferMode::Proxy { .. }, ..) => {
+                    handle_proxy(conn, ctx, matched, &handshake).await
+                }
+            }
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -494,7 +665,7 @@ async fn main() -> Result<(), Whatever> {
         let span = tracing::info_span!("connection", ip = %addr, u = tracing::field::Empty, a = tracing::field::Empty);
         span.in_scope(|| info!("Connected"));
         tokio::spawn(async move {
-            let mut conn = Connection::new(socket);
+            let mut conn = Connection::new(socket, addr);
             match handle(&mut conn, ctx).instrument(span.clone()).await {
                 Ok(_) => (),
                 Err(e) => {
@@ -508,7 +679,9 @@ async fn main() -> Result<(), Whatever> {
                     });
                     // Send error to client too
                     let raw_packet = match conn.state {
-                        ConnectionState::Handshake => return,
+                        ConnectionState::Handshake
+                        | ConnectionState::Status
+                        | ConnectionState::Proxy => return,
                         ConnectionState::Login => {
                             match make_raw(&LoginDisconnect {
                                 reason: make_json_text(&format!("{}", e)),

@@ -1,0 +1,25 @@
+listen: "0.0.0.0:25565"
+
+routes:
+  - match: "*"
+    status:
+      type: static
+      fake_protocol_version: true
+      json:
+        version:
+          name: "1.21.5"
+          protocol: 770
+        players:
+          max: 0
+          online: 0
+        description:
+          text: "Not Mineplex"
+          color: "red"
+    destination:
+      type: transfer
+      host: "play.mineplex.com"
+      port: 25565
+      rewrite_address: true
+      transfer_mode:
+        type: proxy
+        haproxy: false
