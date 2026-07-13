@@ -1,0 +1,90 @@
+use std::{net::SocketAddr, time::Duration};
+
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    pub listen: SocketAddr,
+    pub routes: Vec<Route>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Route {
+    #[serde(rename = "match")]
+    pub pattern: String,
+    pub status: StatusConfig,
+    pub destination: Destination,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum Destination {
+    #[serde(rename = "transfer")]
+    Transfer { host: String, port: u16 },
+    #[serde(rename = "kick")]
+    Kick { message: serde_json::Value },
+}
+
+#[derive(Debug, Deserialize)]
+pub enum StatusConfig {
+    Static {
+        json: serde_json::Value,
+        fake_protocol_version: bool,
+    },
+    FetchFrom {
+        host: String,
+        port: u16,
+        #[serde(default)]
+        rewrite_address: bool,
+        #[serde(default)]
+        cache_ttl: Option<u64>,
+    },
+}
+
+impl StatusConfig {
+    pub fn cache_ttl(&self) -> Option<Duration> {
+        match self {
+            StatusConfig::FetchFrom { cache_ttl, .. } => cache_ttl.map(Duration::from_secs),
+            _ => None,
+        }
+    }
+
+    pub fn cache_key(&self) -> Option<String> {
+        match self {
+            StatusConfig::FetchFrom { host, port, .. } => Some(format!("{host}:{port}")),
+            _ => None,
+        }
+    }
+}
+
+impl Config {
+    pub fn parse(yaml: &str) -> Result<Self, serde_yaml::Error> {
+        serde_yaml::from_str(yaml)
+    }
+
+    pub fn match_host(&self, address: &str) -> Option<&Route> {
+        self.routes.iter().find(|x| x.matches(address))
+    }
+}
+
+impl Route {
+    fn matches(&self, address: &str) -> bool {
+        if self.pattern == "*" {
+            return true;
+        }
+
+        if let Some(suffix) = self.pattern.strip_prefix("*.") {
+            // *.example.com matches foo.example.com, bar.example.com, etc.
+            return address == suffix || address.ends_with(&format!(".{suffix}"));
+        }
+
+        if let Some(prefix) = self.pattern.strip_suffix(".*") {
+            // example.* matches example.com, example.org, etc.
+            return address.starts_with(prefix)
+                && (address.len() == prefix.len()
+                    || address.as_bytes().get(prefix.len()) == Some(&b'.'));
+        }
+
+        address == self.pattern
+    }
+}

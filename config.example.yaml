@@ -1,0 +1,51 @@
+listen: "0.0.0.0:25565"
+
+routes:
+  - match: "lobby.example.com"
+    status: !FetchFrom
+      host: "lobby.example.com"
+      port: 25565
+      rewrite_address: true
+      cache_ttl: 30
+    destination:
+      type: transfer
+      host: "lobby.example.com"
+      port: 25565
+
+  - match: "*.example.com"
+    status: !Static
+      fake_protocol_version: false
+      json:
+        version:
+          name: "1.21.5"
+          protocol: 770
+        players:
+          max: 1000
+          online: 0
+          sample: []
+        description:
+          text: "Minigame Network"
+          color: "gold"
+    destination:
+      type: transfer
+      host: "play.example.com"
+      port: 25565
+
+  - match: "*"
+    status: !Static
+      fake_protocol_version: true
+      json:
+        version:
+          name: "1.21.5"
+          protocol: 770
+        players:
+          max: 0
+          online: 0
+        description:
+          text: "No server found"
+          color: "red"
+    destination:
+      type: kick
+      message:
+        text: "Unknown server. Please connect via a valid hostname."
+        color: "red"
