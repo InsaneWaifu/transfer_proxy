@@ -257,21 +257,26 @@ async fn handle_status(
             rewrite_address,
             ..
         } => {
-            let cache_key = matched.status.cache_key().unwrap();
+            let resolved_host: &str = if host == "*" {
+                &handshake.server_address
+            } else {
+                host
+            };
+            let cache_key = matched.status.cache_key(resolved_host).unwrap();
             let ttl = matched.status.cache_ttl().unwrap();
             let response = match ctx.cache.get(&cache_key, ttl) {
                 Some(cached) => cached,
                 None => {
                     let mut fetch_from_stream = timeout(
                         Duration::from_secs(3),
-                        TcpStream::connect((host.as_str(), *port)),
+                        TcpStream::connect((resolved_host, *port)),
                     )
                     .await
                     .context(TimeoutSnafu)?
                     .context(FetchingStatusSnafu)?;
                     let mut handshake2 = handshake.clone();
                     if *rewrite_address {
-                        handshake2.server_address = host.clone();
+                        handshake2.server_address = resolved_host.to_owned();
                         handshake2.server_port = *port;
                     }
                     make_raw(&handshake2)?
@@ -382,10 +387,16 @@ async fn handle_transfer(
         unreachable!()
     };
 
-    info!("Transferring to {host}:{port}");
+    let resolved_host: &str = if host == "*" {
+        &handshake.server_address
+    } else {
+        host
+    };
+
+    info!("Transferring to {resolved_host}:{port}");
     trace!("Received login ack; sending transfer");
     conn.write_packet(make_raw(&Transfer {
-        host: host.to_owned(),
+        host: resolved_host.to_owned(),
         port: VarInt(*port as i32),
     })?)
     .await?;
@@ -425,7 +436,13 @@ async fn handle_proxy(
         unreachable!()
     };
 
-    info!("Proxying to {host}:{port}");
+    let resolved_host: &str = if host == "*" {
+        &handshake.server_address
+    } else {
+        host
+    };
+
+    info!("Proxying to {resolved_host}:{port}");
 
     let haproxy = match transfer_mode {
         TransferMode::Opportunistic { haproxy } | TransferMode::Proxy { haproxy } => *haproxy,
@@ -434,13 +451,13 @@ async fn handle_proxy(
     let mut handshake = handshake.clone();
 
     if *rewrite_address {
-        handshake.server_address = host.clone();
+        handshake.server_address = resolved_host.to_owned();
         handshake.server_port = *port;
     }
 
     let mut stream = timeout(
         Duration::from_secs(3),
-        TcpStream::connect((host.as_str(), *port)),
+        TcpStream::connect((resolved_host, *port)),
     )
     .await
     .context(TimeoutSnafu)?

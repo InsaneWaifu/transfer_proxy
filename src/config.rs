@@ -74,9 +74,9 @@ impl StatusConfig {
         }
     }
 
-    pub fn cache_key(&self) -> Option<String> {
+    pub fn cache_key(&self, resolved_host: &str) -> Option<String> {
         match self {
-            StatusConfig::FetchFrom { host, port, .. } => Some(format!("{host}:{port}")),
+            StatusConfig::FetchFrom {  port, .. } => Some(format!("{resolved_host}:{port}")),
             _ => None,
         }
     }
