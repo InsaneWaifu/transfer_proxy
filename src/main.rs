@@ -82,7 +82,7 @@ enum ProxyError {
     FetchingStatus {
         source: std::io::Error,
     },
-
+    #[snafu(display("proxy error: {source}"))]
     Proxy {
         source: std::io::Error,
     },
@@ -461,7 +461,7 @@ async fn handle_proxy(
     )
     .await
     .context(TimeoutSnafu)?
-    .context(FetchingStatusSnafu)?;
+    .context(ProxySnafu)?;
 
     if haproxy {
         const HAPROXY_HEADER_V2: &[u8] = &[
@@ -538,6 +538,7 @@ async fn handle(conn: &mut Connection, ctx: &'static Context) -> Result<()> {
     let handshake: Handshake = conn.read_packet_as().await?;
     trace!("{handshake:?}");
     tracing::Span::current().record("a", &handshake.server_address);
+    tracing::Span::current().record("v", &handshake.protocol_version.0);
 
     match handshake.intent {
         Handshake::INTENT_LOGIN => conn.state = ConnectionState::Login,
@@ -679,7 +680,7 @@ async fn main() -> Result<(), Whatever> {
             .accept()
             .await
             .whatever_context("Failed to accept client")?;
-        let span = tracing::info_span!("connection", ip = %addr, u = tracing::field::Empty, a = tracing::field::Empty);
+        let span = tracing::info_span!("connection", ip = %addr, u = tracing::field::Empty, a = tracing::field::Empty, v = tracing::field::Empty);
         span.in_scope(|| info!("Connected"));
         tokio::spawn(async move {
             let mut conn = Connection::new(socket, addr);

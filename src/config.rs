@@ -98,6 +98,8 @@ impl Route {
             return true;
         }
 
+        let address = address.strip_suffix("\0FML3\0").unwrap_or(address);
+
         if let Some(suffix) = self.pattern.strip_prefix("*.") {
             return address == suffix || address.ends_with(&format!(".{suffix}"));
         }
